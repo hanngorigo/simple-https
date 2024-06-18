@@ -24,6 +24,7 @@ use flate2::write::ZlibEncoder;
 use flate2::Compression;
 use serde::{Serialize, Deserialize};
 use std::collections::HashMap;
+use rand::Rng;
 
 struct Cache {
     cache: HashMap<String, Vec<u8>>,
@@ -91,54 +92,50 @@ impl Metrics {
 
 struct Shard {
     cache: Cache,
+    client: Client,
 }
 
 impl Shard {
     async fn new(size: usize) -> Self {
         Shard {
             cache: Cache::new(size).await,
+            client: Client::new().await,
         }
     }
 }
 
 struct AppState {
-    cache: Cache,
-    client: Client,
+    shards: Vec<Shard>,
     metrics: Metrics,
     prometheus_handle: PrometheusHandle,
     shutdown_rx: mpsc::Receiver<()>,
     shutdown_handle: JoinHandle<()>,
-    shards: Vec<Shard>,
 }
 
 impl AppState {
     async fn new(config: CacheConfig) -> Result<Self, CachingServerError> {
-        let cache = Cache::new(config.size).await;
-        let client = Client::new().await;
+        let mut shards = Vec::new();
+        for _ in 0..config.shards {
+            let shard = Shard::new(config.size / config.shards).await;
+            shards.push(shard);
+        }
+
         let metrics = Metrics::new().await;
         let prometheus_handle = PrometheusBuilder::new()
-            .listen("0.0.0.0:9090")
-            .unwrap();
+           .listen("0.0.0.0:9090")
+           .unwrap();
         let (shutdown_tx, shutdown_rx) = mpsc::channel(1);
         let shutdown_handle = tokio::spawn(async move {
             shutdown_tx.closed().await;
             prometheus_handle.shutdown().await;
         });
 
-        let mut shards = Vec::new();
-        for i in 0..config.shards {
-            let shard = Shard::new(config.size / config.shards).await;
-            shards.push(shard);
-        }
-
         Ok(AppState {
-            cache,
-            client,
+            shards,
             metrics,
             prometheus_handle,
             shutdown_rx,
             shutdown_handle,
-            shards,
         })
     }
 
@@ -149,7 +146,10 @@ impl AppState {
         let start = Instant::now();
         let key = format!("{}{}{}{}", req.method(), req.uri(), req.query(), req.body().await?.to_vec());
 
-        let mut response = match self.cache.get(&key).await {
+        let shard_id = self.get_shard_id(key);
+        let shard = self.shards.get(shard_id).ok_or(CachingServerError::new_other("Shard not found"))?;
+
+        let mut response = match shard.cache.get(&key).await {
             Ok(cached_response) => {
                 self.metrics.cache_hits.inc(1);
                 info!("Cache hit for {}", key);
@@ -158,9 +158,9 @@ impl AppState {
             Err(tower_cache::Error::ItemNotFound) => {
                 self.metrics.cache_misses.inc(1);
                 info!("Cache miss for {}", key);
-                let response = self.client.request(req).await?;
+                let response = shard.client.request(req).await?;
                 let compressed_response = self.compress_response(response).await?;
-                self.cache.set(key, compressed_response.clone()).await?;
+                shard.cache.set(key, compressed_response.clone()).await?;
                 response
             }
             Err(err) => {
@@ -169,7 +169,7 @@ impl AppState {
         };
 
         let body = hyper::body::to_bytes(response.into_body()).await?;
-        self.metrics.cache_size.set(self.cache.cache.len() as i64);
+        self.metrics.cache_size.set(self.shards.iter().map(|shard| shard.cache.cache.len()).sum::<usize>() as i64);
 
         self.metrics.cache_latency.record(start.elapsed().as_secs_f64());
         Ok(response)
@@ -178,7 +178,9 @@ impl AppState {
     async fn invalidate_cache(&self, key: &str) -> Result<(), CachingServerError> {
         self.metrics.cache_invalidations.inc(1);
         info!("Invalidating cache for {}", key);
-        self.cache.cache.remove(key);
+        for shard in &self.shards {
+            shard.cache.cache.remove(key);
+        }
         Ok(())
     }
 
@@ -195,12 +197,6 @@ impl AppState {
         Ok(compressed_response)
     }
 
-    async fn get_shard(&self, key: &str) -> Result<&Shard, CachingServerError> {
-        let shard_id = self.get_shard_id(key);
-        let shard = self.shards.get(shard_id).ok_or(CachingServerError::new_other("Shard not found"))?;
-        Ok(shard)
-    }
-
     fn get_shard_id(&self, key: &str) -> usize {
         let mut hasher = DefaultHasher::new();
         hasher.write(key.as_bytes());
@@ -210,6 +206,11 @@ impl AppState {
 
     async fn balance_load(&self) {
         // implement load balancing logic here
+        // for now, just shuffle the shards
+        let mut rng = rand::thread_rng();
+        let mut shards = self.shards.clone();
+        shards.shuffle(&mut rng);
+        self.shards = shards;
     }
 }
 
@@ -242,25 +243,25 @@ async fn main() -> Result<(), CachingServerError> {
     let app_state = AppState::new(config).await?;
 
     let app = Router::new()
-        .route("/", get(handle_index))
-        .route("/healthz", get(handle_healthz))
-        .route("/metrics", get(handle_metrics))
-        .layer(TraceLayer::new_for_http())
-        .layer(Extension(app_state.clone()))
-        .layer(CacheLayer::new(app_state.cache.clone()));
+       .route("/", get(handle_index))
+       .route("/healthz", get(handle_healthz))
+       .route("/metrics", get(handle_metrics))
+       .layer(TraceLayer::new_for_http())
+       .layer(Extension(app_state.clone()))
+       .layer(CacheLayer::new(app_state.shards[0].cache.clone()));
 
     let addr = std::net::SocketAddr::from(([127, 0, 0, 1], 3000));
     info!("Starting server on {}", addr);
     axum::Server::bind(&addr)
-        .serve(app.into_make_service())
-        .await
-        .unwrap();
+       .serve(app.into_make_service())
+       .await
+       .unwrap();
 
     Ok(())
 }
 
 async fn handle_index(Extension(state): Extension<AppState>) -> Result<Response<Body>, CachingServerError> {
-    let response = state.client.request(Request::new(Body::empty())).await?;
+    let response = state.shards[0].client.request(Request::new(Body::empty())).await?;
     let body = hyper::body::to_bytes(response.into_body()).await?;
     Ok(Response::from_data(Body::from(body)))
 }
@@ -272,9 +273,9 @@ async fn handle_healthz(Extension(state): Extension<AppState>) -> Result<Respons
 async fn handle_metrics(Extension(state): Extension<AppState>) -> Result<Response<Body>, CachingServerError> {
     state.metrics.display_metrics().await;
     let response = ServeDir::new(".")
-        .handle_concurrent(10)
-        .serve(Request::new(Body::empty()))
-        .await?;
+       .handle_concurrent(10)
+       .serve(Request::new(Body::empty()))
+       .await?;
 
     Ok(response)
 }
