@@ -1,0 +1,14 @@
+[dependencies]
+axum = "0.6.2"
+tokio = { version = "1.21.2", features = ["full"] }
+tower = "0.4.12"
+tower-http = "0.4.12"
+log = "0.4.17"
+metrics = "0.21.0"
+metrics-exporter-prometheus = "0.21.0"
+reqwest = "0.11.12"
+flate2 = "1.0.24"
+serde = { version = "1.0.137", features = ["derive"] }
+rand = "0.9.3"
+env_logger = "0.10.0"
+hyper = "0.14.10"
